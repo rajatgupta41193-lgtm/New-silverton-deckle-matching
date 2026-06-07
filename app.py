@@ -1,247 +1,485 @@
 import streamlit as st
 import itertools
 import pandas as pd
-
-# Set page configurations for mobile responsiveness and wide desktop screens
-st.set_page_config(page_title="Paper Mill Trim Optimizer", layout="wide", page_icon="🧻")
+import numpy as np
 
 # =====================================================================
-# 1. INITIAL SESSION STATE FOR DYNAMIC ITEMS (Preset Inventory Repository)
+# CONSTANTS
+# =====================================================================
+MIN_DECKLE    = 2160
+MAX_DECKLE    = 2200
+MIN_PATTERN_MT = 1.5   # No pattern may run less than this tonnage
+
+st.set_page_config(
+    page_title="Paper Mill Deckle Optimizer",
+    layout="wide",
+    page_icon="🧻"
+)
+
+# =====================================================================
+# SESSION STATE — default inventory
 # =====================================================================
 if "repository" not in st.session_state:
     st.session_state.repository = {
-        "210 ml": [790, 600],
-        "80/46 ml": [915, 790, 660],
-        "60/46 ml": [917, 790, 660],
-        "80/50 ml": [860, 718, 580],
-        "50/46 new": [890, 764, 638]
+        "210 ml":    [790, 600],
+        "80/46 ml":  [915, 790, 660],
+        "60/46 ml":  [917, 790, 660],
+        "80/50 ml":  [860, 718, 580],
+        "50/46 new": [890, 764, 638],
     }
 
-MIN_DECKLE = 2160
-MAX_DECKLE = 2200
+# =====================================================================
+# CORE ENGINES
+# =====================================================================
+
+def find_valid_patterns(selected_items, repository):
+    """
+    Enumerate ALL valid 3-reel zero-waste patterns within deckle range.
+    Returns list of dicts: {deckle, widths:[w0,w1,w2], products:[p0,p1,p2]}
+    sorted highest deckle first.
+    """
+    slots = []
+    for item in selected_items:
+        for w in repository.get(item, []):
+            slots.append((w, item))
+
+    valid = []
+    seen  = set()
+    L     = len(slots)
+
+    for i in range(L):
+        for j in range(i, L):
+            for k in range(j, L):
+                total = slots[i][0] + slots[j][0] + slots[k][0]
+                if not (MIN_DECKLE <= total <= MAX_DECKLE):
+                    continue
+                triplet = sorted(
+                    [(slots[i][0], slots[i][1]),
+                     (slots[j][0], slots[j][1]),
+                     (slots[k][0], slots[k][1])],
+                    key=lambda x: (x[0], x[1])
+                )
+                key = "|".join(f"{w}:{p}" for w, p in triplet) + f"|{total}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                valid.append({
+                    "deckle":   total,
+                    "widths":   [t[0] for t in triplet],
+                    "products": [t[1] for t in triplet],
+                })
+
+    valid.sort(key=lambda x: (-x["deckle"], x["widths"][0]))
+    return valid
+
+
+def select_max_deckle_patterns(valid_patterns, selected_items, total_mt):
+    """
+    Strategy 1: greedy highest-deckle selection covering all products.
+    Enforces MIN_PATTERN_MT — drops lowest-priority patterns until
+    equal-split share >= 1.5 mt for all survivors.
+    """
+    operational = []
+    covered = set()
+    for pat in valid_patterns:
+        new_prods = [p for p in pat["products"] if p not in covered]
+        if new_prods or pat["deckle"] == MAX_DECKLE:
+            operational.append(pat)
+            covered.update(pat["products"])
+        if len(covered) >= len(selected_items) and len(operational) >= 2:
+            break
+
+    result = operational if operational else (valid_patterns[:1] if valid_patterns else [])
+
+    # Drop tail patterns that would fall below MIN_PATTERN_MT on equal split
+    while len(result) > 1 and total_mt / len(result) < MIN_PATTERN_MT:
+        result = result[:-1]
+
+    return result
+
+
+def project_simplex(v, total):
+    """Project vector v onto the simplex Σx=total, x≥0."""
+    n = len(v)
+    u = sorted(v, reverse=True)
+    cssv, rho = 0.0, 0
+    for i in range(n):
+        cssv += u[i]
+        if u[i] - (cssv - total) / (i + 1) > 0:
+            rho = i
+    theta = (sum(u[:rho + 1]) - total) / (rho + 1)
+    return [max(0.0, vi - theta) for vi in v]
+
+
+def solve_balanced_lp(all_patterns, target_weights, total_mt, max_iter=8000):
+    """
+    Strategy 2: Adam gradient descent on all valid patterns.
+    Minimises Σ_prod (actual_yield - target)²
+    Subject to: x_i >= 0, Σ x_i = total_mt, each used pattern >= MIN_PATTERN_MT.
+
+    Returns (tonnages, used_patterns).
+    """
+    n = len(all_patterns)
+    if n == 0:
+        return [], []
+
+    prod_list = list(target_weights.keys())
+
+    # Precompute fraction matrix: A[i][p] = width / deckle for slot p in pattern i
+    # Store as list of dicts for speed
+    frac = []
+    for pat in all_patterns:
+        d = {}
+        for w, p in zip(pat["widths"], pat["products"]):
+            d[p] = d.get(p, 0.0) + w / pat["deckle"]
+        frac.append(d)
+
+    def get_actuals(x):
+        a = {p: 0.0 for p in prod_list}
+        for i, fi in enumerate(frac):
+            for p, f in fi.items():
+                if p in a:
+                    a[p] += x[i] * f
+        return a
+
+    # Initialise
+    x = [total_mt / n] * n
+    m = [0.0] * n
+    v = [0.0] * n
+    beta1, beta2, eps, lr = 0.9, 0.999, 1e-8, 0.05
+
+    for it in range(1, max_iter + 1):
+        actuals = get_actuals(x)
+        grad = [0.0] * n
+        for i, fi in enumerate(frac):
+            for p, f in fi.items():
+                if p in target_weights:
+                    grad[i] += 2.0 * (actuals[p] - target_weights.get(p, 0.0)) * f
+
+        m = [beta1 * m[i] + (1 - beta1) * grad[i] for i in range(n)]
+        v = [beta2 * v[i] + (1 - beta2) * grad[i] ** 2 for i in range(n)]
+        m_hat = [m[i] / (1 - beta1 ** it) for i in range(n)]
+        v_hat = [v[i] / (1 - beta2 ** it) for i in range(n)]
+        x = [x[i] - lr * m_hat[i] / (v_hat[i] ** 0.5 + eps) for i in range(n)]
+        x = project_simplex(x, total_mt)
+
+    # Phase 1: remove noise-floor patterns (< 0.5% of total)
+    noise_floor = total_mt * 0.005
+    active_idx = [i for i in range(n) if x[i] >= noise_floor]
+    if not active_idx:
+        active_idx = [x.index(max(x))]
+
+    # Phase 2: enforce MIN_PATTERN_MT iteratively
+    tons = [x[i] for i in active_idx]
+    s = sum(tons)
+    tons = [t * total_mt / s for t in tons]   # rescale to total_mt
+
+    changed = True
+    while changed and len(active_idx) > 1:
+        changed = False
+        min_val = min(tons)
+        min_pos = tons.index(min_val)
+        if min_val < MIN_PATTERN_MT:
+            surplus    = tons[min_pos]
+            remain     = [t for j, t in enumerate(tons) if j != min_pos]
+            remain_sum = sum(remain)
+            if remain_sum > 0:
+                tons = [t + surplus * t / remain_sum for t in remain]
+            else:
+                tons = [total_mt / len(remain)] * len(remain)
+            active_idx = [idx for j, idx in enumerate(active_idx) if j != min_pos]
+            changed = True
+
+    # Final rescale
+    final_sum = sum(tons)
+    tonnages     = [t * total_mt / final_sum for t in tons]
+    used_patterns = [all_patterns[i] for i in active_idx]
+
+    return tonnages, used_patterns
+
+
+def compute_actuals(patterns, tonnages):
+    out = {}
+    for pat, ton in zip(patterns, tonnages):
+        for w, p in zip(pat["widths"], pat["products"]):
+            out[p] = out.get(p, 0.0) + ton * (w / pat["deckle"])
+    return out
+
+
+def rmse(actuals, targets):
+    keys = list(targets.keys())
+    if not keys:
+        return 0.0
+    sq = sum((actuals.get(k, 0.0) - targets.get(k, 0.0)) ** 2 for k in keys)
+    return (sq / len(keys)) ** 0.5
+
 
 # =====================================================================
-# 2. WEB APPLICATION SIDEBAR & USER RUN SETTINGS
+# SIDEBAR
 # =====================================================================
 st.sidebar.header("📋 Production Parameters")
 
-# Input for overall run tonnage requirement
-total_material = st.sidebar.number_input(
-    "Enter TOTAL quantity required (Metric Tons / mt):", 
-    min_value=0.1, 
-    value=12.0, 
-    step=0.5,
-    format="%.2f"
+total_mt = st.sidebar.number_input(
+    "Total quantity required (mt):",
+    min_value=0.1, value=12.0, step=0.5, format="%.2f"
 )
 
-# Render checkbox catalog of active manufacturing choices
-st.sidebar.subheader("Select Required Items for Current Run")
+st.sidebar.caption(
+    f"⚠️ **Constraint:** Every active pattern must carry "
+    f"**≥ {MIN_PATTERN_MT} mt**. Patterns below this floor are "
+    f"dropped and their tonnage redistributed."
+)
+
+st.sidebar.subheader("Select Items for This Run")
 selected_items = []
 for item in list(st.session_state.repository.keys()):
-    if st.sidebar.checkbox(item, value=True, help=f"Current Widths: {st.session_state.repository[item]} mm"):
+    widths_str = ", ".join(map(str, st.session_state.repository[item]))
+    if st.sidebar.checkbox(item, value=True, help=f"Widths: {widths_str} mm"):
         selected_items.append(item)
 
-# Render target quantity input logs per size item
 st.sidebar.subheader("Target Weights per Item (mt)")
 item_quantities = {}
 for item in selected_items:
-    default_val = round(total_material / max(len(selected_items), 1), 2)
+    default = round(total_mt / max(len(selected_items), 1), 2)
     item_quantities[item] = st.sidebar.number_input(
-        f"Target weight for {item}:", 
-        min_value=0.0, 
-        value=default_val, 
-        step=0.5,
-        format="%.2f",
-        key=f"qty_{item}"
+        f"{item}:", min_value=0.0, value=default, step=0.5,
+        format="%.2f", key=f"qty_{item}"
     )
 
 if not selected_items:
-    st.error("❌ Please select at least one item from the sidebar checklist to begin configuration.")
+    st.error("❌ Select at least one item from the sidebar.")
     st.stop()
 
-# Radio Strategy Selector Switch
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Optimization Plan Option")
-strategy_option = st.sidebar.radio(
-    "Choose your priority strategy:",
-    options=[
-        "Option 1: Maximize Deckle (Strict Max 15% Quantity Shift)", 
-        "Option 2: Balanced Strategy"
-    ]
+# =====================================================================
+# TITLE
+# =====================================================================
+st.title("🧻 Paper Mill Deckle Optimization System")
+st.markdown(
+    "**0 mm trim · 3-reel slitter · LP Engine v2.1 · Adam Optimiser · ≥ 1.5 mt per pattern**"
 )
 
 # =====================================================================
-# 3. MAIN DISPLAY AREA: INVENTORY CONFIGURATION DASHBOARD
+# INVENTORY MANAGER
 # =====================================================================
-st.title("🧻 Paper Mill Production Deckle Optimization System")
-st.markdown("Calculate zero-waste (0 mm trim) 3-reel slitter configurations with intelligent quantity balancing.")
+with st.expander("🔧 Manage Inventory & Item Widths", expanded=False):
+    col1, col2 = st.columns(2)
 
-with st.expander("🔧 MANAGE INVENTORY & CHANGE ITEM WIDTHS", expanded=False):
-    st.subheader("Modify Widths of Existing Items or Create New Ones")
-    col_manage_1, col_manage_2 = st.columns(2)
-    
-    with col_manage_1:
-        st.markdown("**Option A: Modify or Add Item**")
-        item_to_edit = st.selectbox(
-            "Select an Item to change/create:", 
-            options=list(st.session_state.repository.keys()) + ["-- Create New Item --"]
-        )
-        
-        if item_to_edit == "-- Create New Item --":
-            target_item_name = st.text_input("Enter New Product Name:", placeholder="e.g., 40ml new").strip()
-            current_widths_str = ""
+    with col1:
+        st.markdown("**Option A — Modify or Add Item**")
+        options = list(st.session_state.repository.keys()) + ["-- Create New Item --"]
+        edit_target = st.selectbox("Select item:", options)
+
+        if edit_target == "-- Create New Item --":
+            new_name    = st.text_input("New product name:", placeholder="e.g., 40ml new").strip()
+            widths_val  = ""
         else:
-            target_item_name = item_to_edit
-            current_widths_str = ", ".join(map(str, st.session_state.repository[item_to_edit]))
-            
+            new_name   = edit_target
+            widths_val = ", ".join(map(str, st.session_state.repository[edit_target]))
+
         widths_input = st.text_input(
-            f"Enter width values for '{target_item_name}' (separate with commas):", 
-            value=current_widths_str,
-            placeholder="e.g., 790, 660, 600"
+            f"Widths for '{new_name or 'new item'}' (comma-separated mm):",
+            value=widths_val, placeholder="e.g., 790, 660, 600"
         )
-        
-        if st.button("💾 Save Changes / Add Product"):
-            if target_item_name and widths_input:
+
+        if st.button("💾 Save / Add Product"):
+            if new_name and widths_input:
                 try:
-                    parsed_widths = [int(w.strip()) for w in widths_input.split(",") if w.strip()]
-                    if parsed_widths:
-                        st.session_state.repository[target_item_name] = parsed_widths
-                        st.success(f"Successfully updated '{target_item_name}' to {parsed_widths} mm!")
+                    parsed = [int(w.strip()) for w in widths_input.split(",") if w.strip()]
+                    if parsed:
+                        st.session_state.repository[new_name] = parsed
+                        st.success(f"✅ Saved '{new_name}': {parsed} mm")
                         st.rerun()
                     else:
-                        st.error("Please provide valid number widths.")
+                        st.error("Enter valid integer widths.")
                 except ValueError:
-                    st.error("Widths must be whole numbers separated by commas.")
+                    st.error("Widths must be whole numbers.")
             else:
-                st.error("Please complete both fields.")
-                
-    with col_manage_2:
-        st.markdown("**Option B: Delete Item From List**")
-        item_to_delete = st.selectbox("Select an item to completely remove:", options=list(st.session_state.repository.keys()))
-        if st.button("🗑️ Delete Selected Item", type="primary"):
-            if item_to_delete in st.session_state.repository:
-                del st.session_state.repository[item_to_delete]
-                st.success(f"Removed '{item_to_delete}' from system.")
-                st.rerun()
+                st.error("Fill in both fields.")
+
+    with col2:
+        st.markdown("**Option B — Delete Item**")
+        del_target = st.selectbox(
+            "Select item to delete:",
+            list(st.session_state.repository.keys()),
+            key="del_sel"
+        )
+        if st.button("🗑️ Delete Item", type="primary"):
+            del st.session_state.repository[del_target]
+            st.success(f"Removed '{del_target}'.")
+            st.rerun()
 
 # =====================================================================
-# 4. ROBUST PURE PYTHON COMBINATORIAL OPTIMIZATION ENGINE
+# ENGINE — compute both strategies
 # =====================================================================
-master_list = []
-for item in selected_items:
-    if item in st.session_state.repository:
-        for w in st.session_state.repository[item]:
-            master_list.append({"width": w, "product": item})
+all_patterns = find_valid_patterns(selected_items, st.session_state.repository)
 
-valid_patterns = []
-seen_combinations = set()
-
-# Process potential combos using exact 3-reel slitting thresholds
-for combo in itertools.combinations_with_replacement(master_list, 3):
-    widths_sorted = tuple(sorted([item["width"] for item in combo]))
-    products_sorted = tuple(sorted([item["product"] for item in combo]))
-    total_width = sum(widths_sorted)
-
-    if MIN_DECKLE <= total_width <= MAX_DECKLE:
-        pattern_id = (total_width, widths_sorted, products_sorted)
-        if pattern_id not in seen_combinations:
-            seen_combinations.add(pattern_id)
-            valid_patterns.append({
-                "deckle": total_width,
-                "widths": widths_sorted,
-                "products": products_sorted
-            })
-
-if not valid_patterns:
-    st.error("❌ Mathematically impossible to find a zero-waste 3-reel pattern with the chosen sizes within 2160 mm - 2200 mm.")
+if not all_patterns:
+    st.error(
+        f"❌ No valid 3-reel zero-waste patterns exist within "
+        f"{MIN_DECKLE}–{MAX_DECKLE} mm for the selected items."
+    )
     st.stop()
 
-# Sort descending to favor the maximum machine limits
-valid_patterns.sort(key=lambda x: (-x["deckle"], x["widths"]))
+# Strategy 1 — Max Deckle
+max_patterns = select_max_deckle_patterns(all_patterns, selected_items, total_mt)
+n_max        = len(max_patterns)
+max_tons     = [total_mt / n_max] * n_max
+max_actuals  = compute_actuals(max_patterns, max_tons)
+max_rmse     = rmse(max_actuals, item_quantities)
 
-operational_patterns = []
-retained_products = set()
-for pattern in valid_patterns:
-    pattern_products = set(pattern["products"])
-    if not pattern_products.issubset(retained_products) or pattern["deckle"] == MAX_DECKLE:
-        operational_patterns.append(pattern)
-        retained_products.update(pattern_products)
+# Strategy 2 — Balanced LP
+with st.spinner("⚙️ Running LP optimiser…"):
+    bal_tons, bal_patterns = solve_balanced_lp(all_patterns, item_quantities, total_mt)
+bal_actuals = compute_actuals(bal_patterns, bal_tons)
+bal_rmse    = rmse(bal_actuals, item_quantities)
 
-if len(operational_patterns) < 4:
-    for pattern in valid_patterns:
-        if pattern not in operational_patterns:
-            operational_patterns.append(pattern)
-        if len(operational_patterns) >= 4:
-            break
+# =====================================================================
+# MODE SELECTOR
+# =====================================================================
+st.write("---")
+mode = st.radio(
+    "**Optimisation Mode:**",
+    ["① Maximize Deckle", "② Balanced LP", "Compare Both"],
+    index=2,
+    horizontal=True
+)
+show_max = mode in ["① Maximize Deckle", "Compare Both"]
+show_bal = mode in ["② Balanced LP", "Compare Both"]
 
-num_pats = len(operational_patterns)
+# =====================================================================
+# LP INFO STRIP
+# =====================================================================
+if show_bal:
+    st.info(
+        f"**② Balanced LP:** Evaluates all **{len(all_patterns)}** valid zero-waste patterns "
+        f"simultaneously using Adam gradient descent (8,000 iterations). Tonnage is distributed "
+        f"to minimise Σ(actual − target)² per product. "
+        f"**Constraint: every active pattern must carry ≥ {MIN_PATTERN_MT} mt** — patterns below "
+        f"this floor are dropped and their tonnage redistributed proportionally. "
+        f"RMSE = root mean square error; lower = closer to your targets."
+    )
 
-# Calculate yields for a set of weights vector
-def compute_yields(weights_list):
-    yields = {item: 0.0 for item in selected_items}
-    for idx, pattern in enumerate(operational_patterns):
-        w_pat = weights_list[idx]
-        for width, prod in zip(pattern["widths"], pattern["products"]):
-            if prod in yields:
-                yields[prod] += w_pat * (width / pattern["deckle"])
-    return yields
+# =====================================================================
+# HELPER: render one strategy's patterns
+# =====================================================================
+def render_strategy(patterns, tonnages, strategy_label, rmse_val):
+    rmse_color = "🟢" if rmse_val < 0.3 else ("🟡" if rmse_val < 1.0 else "🔴")
+    st.markdown(
+        f"**{strategy_label}** &nbsp; {rmse_color} RMSE: `{rmse_val:.3f}`",
+        unsafe_allow_html=True
+    )
 
-best_weights = None
+    copy_lines = []
+    for i, (pat, ton) in enumerate(zip(patterns, tonnages)):
+        w0, w1, w2 = pat["widths"]
+        deckle     = pat["deckle"]
+        tag        = "🔴 MAX" if deckle == MAX_DECKLE else "🔵 OK"
 
-if "Option 1" in strategy_option:
-    # --- STRATEGY 1: MAXIMIZE DECKLE SIZE WHILE HOLDING QUANTITY SHIFTS INSIDE ±15% ---
-    best_score = float('-inf')
-    for steps in itertools.product(range(0, 21), repeat=num_pats):
-        s_sum = sum(steps)
-        if s_sum == 0:
-            continue
-        test_w = [(s / s_sum) * total_material for s in steps]
-        sim_y = compute_yields(test_w)
-        
-        valid_allocation = True
-        for item in selected_items:
-            req = item_quantities[item]
-            if req > 0:
-                deviation = abs(sim_y[item] - req) / req
-                if deviation > 0.15:
-                    valid_allocation = False
-                    break
-        
-        if valid_allocation:
-            score = sum(test_w[i] * operational_patterns[i]["deckle"] for i in range(num_pats))
-            if score > best_score:
-                best_score = score
-                best_weights = test_w
+        st.markdown(
+            f"**Pattern {i+1}:** `{w0}+{w1}+{w2}={deckle} mm` {tag} — "
+            f"`{ton:.3f} mt`"
+        )
 
-    # Fallback protocol if constraints are too mathematically rigid for user inputs
-    if best_weights is None:
-        best_score = float('-inf')
-        for steps in itertools.product(range(0, 21), repeat=num_pats):
-            s_sum = sum(steps)
-            if s_sum == 0:
-                continue
-            test_w = [(s / s_sum) * total_material for s in steps]
-            sim_y = compute_yields(test_w)
-            
-            max_dev = max(abs(sim_y[item] - item_quantities[item]) / max(item_quantities[item], 0.1) for item in selected_items)
-            score = sum(test_w[i] * operational_patterns[i]["deckle"] for i in range(num_pats)) - (max_dev * 10000)
-            if score > best_score:
-                best_score = score
-                best_weights = test_w
+        rows = []
+        for pos, (w, prod) in enumerate(zip(pat["widths"], pat["products"]), 1):
+            yield_mt = ton * (w / deckle)
+            rows.append({
+                "Knife Position": f"#{pos}",
+                "Width (mm)":     w,
+                "Product":        prod,
+                "Yield (mt)":     round(yield_mt, 3),
+            })
+        st.table(pd.DataFrame(rows))
+        copy_lines.append(f"{w0}+{w1}+{w2}={deckle}  {ton:.2f} mt")
+
+    return "\n".join(copy_lines)
+
+
+# =====================================================================
+# RESULTS
+# =====================================================================
+st.write("---")
+st.header("📊 Production Blueprint")
+
+if show_max and show_bal:
+    col_max, col_bal = st.columns(2)
+    with col_max:
+        st.subheader("① Maximize Deckle")
+        max_copy = render_strategy(max_patterns, max_tons, "Max Deckle Strategy", max_rmse)
+    with col_bal:
+        st.subheader("② Balanced LP")
+        bal_copy = render_strategy(bal_patterns, bal_tons, "Balanced LP Strategy", bal_rmse)
+
+elif show_max:
+    st.subheader("① Maximize Deckle")
+    max_copy = render_strategy(max_patterns, max_tons, "Max Deckle Strategy", max_rmse)
+    bal_copy = ""
+
 else:
-    # --- STRATEGY 2: BALANCED STRATEGY (MINIMIZE QUANTITY DEVIATION SHIFTS) ---
-    best_score = float('inf')
-    for steps in itertools.product(range(0, 21), repeat=num_pats):
-        s_sum = sum(steps)
-        if s_sum == 0:
-            continue
-        test_w = [(s / s_sum) * total_material for s in steps]
-        sim_y = compute_yields(test_w)
-        
-        score = sum((sim_y[item] - item_quantities[item])**2 for item in selected_items)
-        if score < best_score:
-            best_score = score
-            best_weights = test_w
+    st.subheader("② Balanced LP")
+    bal_copy = render_strategy(bal_patterns, bal_tons, "Balanced LP Strategy", bal_rmse)
+    max_copy = ""
 
-if best_weights is None:
-    best_weights = [total_material / num_pats] * num_patspattern_weights = [round(w, 2) for w in best_weights]Exclude idle patterns that carry near-zero allocation targetsfiltered_patterns = []filtered_weights = []for pat, wt in zip(operational_patterns, pattern_weights):if wt > 0.02:filtered_patterns.append(pat)filtered_weights.append(wt)if filtered_patterns:operational_patterns = filtered_patternspattern_weights = filtered_weightselse:operational_patterns = operational_patterns[:1]pattern_weights = [total_material]simulated_yields = {item: 0.0 for item in selected_items}=====================================================================5. BLUEPRINT WEB DASHBOARD DISPLAY & TEXT FORMATTING=====================================================================st.header(f"📊 Production Blueprint Summary ({total_material:.2f} mt Total Run)")if "Option 1" in strategy_option:st.info("🎯 Strategy: Option 1 Active. Maximizing deckle width while holding item volumes as close to ±15% as mathematically possible.")else:st.success("🎯 Strategy: Option 2 Active. Running custom weights per pattern to match your targets exactly.")cols = st.columns(len(operational_patterns))copyable_text_lines = []for i, (pattern, p_weight) in enumerate(zip(operational_patterns, pattern_weights)):# Safe index positioning extraction to clean up equation linesw1 = pattern["widths"][0]w2 = pattern["widths"][1]w3 = pattern["widths"][2]# Generate requested clean copy frame: 638+645+917=2200 4.29 mtpattern_string = f"{w1}+{w2}+{w3}={pattern['deckle']} {p_weight:.2f} mt"copyable_text_lines.append(pattern_string)with cols[i]:st.subheader(f"✂️ Pattern {i+1}: Deckle {pattern['deckle']} mm")st.metric(label="Target Batch Allocation", value=f"{p_weight:.2f} mt")knife_data = []for j, (w, prod) in enumerate(zip(pattern["widths"], pattern["products"]), 1):weight_fraction = w / pattern["deckle"]calculated_mass = p_weight * weight_fractionif prod in simulated_yields:simulated_yields[prod] += calculated_massknife_data.append({"Knife Target": f"Position #{j}","Width (mm)": w,"Product Allocation": prod,"Yield Output (mt)": round(calculated_mass, 2)})st.table(pd.DataFrame(knife_data))=====================================================================6. UNIFIED COPYABLE TEXT SECTION=====================================================================st.write("---")st.header("📋 Copyable Production Text")st.markdown("Tap the button inside the box below to instantly copy these settings:")final_copy_block = "\n".join(copyable_text_lines)st.code(final_copy_block, language="text")=====================================================================7. QUANTITY ADVICE COMPARISON VIEW=====================================================================st.write("---")st.header("⚖️ Quantity Advice Comparison (Target vs Optimized Output)")comparison_rows = []for prod in selected_items:target = item_quantities.get(prod, 0.0)actual = simulated_yields.get(prod, 0.0)variance = actual - targetcomparison_rows.append({"Product Name": prod,"Requested (mt)": round(target, 2),"Optimized Final Yield (mt)": round(actual, 2),"Variance Delta (mt)": f"+{variance:.2f}" if variance >= 0 else f"{variance:.2f}"})df_compare = pd.DataFrame(comparison_rows)st.dataframe(df_compare, use_container_width=True, hide_index=True)
+# =====================================================================
+# COPYABLE TEXT
+# =====================================================================
+st.write("---")
+st.header("📋 Copyable Production Text")
+
+if show_max and max_copy:
+    st.markdown("**① Max Deckle**")
+    st.code(max_copy, language="text")
+
+if show_bal and bal_copy:
+    st.markdown("**② Balanced LP**")
+    st.code(bal_copy, language="text")
+
+# =====================================================================
+# COMPARISON TABLE
+# =====================================================================
+st.write("---")
+st.header("⚖️ Quantity Advice — Target vs Optimised Output")
+
+rows = []
+for prod in selected_items:
+    tgt  = item_quantities.get(prod, 0.0)
+    row  = {"Product": prod, "Target (mt)": round(tgt, 2)}
+
+    if show_max:
+        m_yield = round(max_actuals.get(prod, 0.0), 3)
+        m_var   = round(m_yield - tgt, 3)
+        row["① Yield (mt)"]    = m_yield
+        row["① Variance (mt)"] = f"+{m_var}" if m_var >= 0 else str(m_var)
+
+    if show_bal:
+        b_yield = round(bal_actuals.get(prod, 0.0), 3)
+        b_var   = round(b_yield - tgt, 3)
+        row["② Yield (mt)"]    = b_yield
+        row["② Variance (mt)"] = f"+{b_var}" if b_var >= 0 else str(b_var)
+
+    rows.append(row)
+
+# Totals row
+total_row = {"Product": "TOTAL", "Target (mt)": round(sum(item_quantities.values()), 2)}
+if show_max:
+    total_row["① Yield (mt)"]    = round(sum(max_actuals.values()), 3)
+    total_row["① Variance (mt)"] = f"RMSE {max_rmse:.3f}"
+if show_bal:
+    total_row["② Yield (mt)"]    = round(sum(bal_actuals.values()), 3)
+    total_row["② Variance (mt)"] = f"RMSE {bal_rmse:.3f}"
+
+rows.append(total_row)
+
+df = pd.DataFrame(rows)
+st.dataframe(df, use_container_width=True, hide_index=True)
+
+# =====================================================================
+# FOOTER
+# =====================================================================
+st.write("---")
+st.caption(
+    f"Deckle range: {MIN_DECKLE}–{MAX_DECKLE} mm · "
+    f"Min pattern tonnage: {MIN_PATTERN_MT} mt · "
+    f"Total valid patterns found: {len(all_patterns)} · "
+    f"LP patterns evaluated: {len(all_patterns)}"
+)
