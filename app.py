@@ -1,8 +1,6 @@
 import streamlit as st
 import itertools
 import pandas as pd
-import numpy as np
-from scipy.optimize import minimize
 
 # Set page configurations
 st.set_page_config(page_title="Paper Mill Trim Optimizer", layout="wide", page_icon="🧻")
@@ -124,7 +122,7 @@ with st.expander("🔧 MANAGE INVENTORY & CHANGE ITEM WIDTHS", expanded=False):
                 st.rerun()
 
 # =====================================================================
-# 4. DECKLE SCHEDULING & DYNAMIC OPTIMIZATION ENGINE
+# 4. PURE PYTHON DECKLE SCHEDULING & SEARCH ENGINE
 # =====================================================================
 master_list = []
 for item in selected_items:
@@ -154,6 +152,7 @@ if not valid_patterns:
     st.error("❌ Mathematically impossible to find a zero-waste 3-reel pattern with the chosen sizes within 2160 mm - 2200 mm.")
     st.stop()
 
+# Greedy coverage sweep to ensure all selected items have at least one usable layout
 valid_patterns.sort(key=lambda x: (-x["deckle"], x["widths"]))
 operational_patterns = []
 retained_products = set()
@@ -164,52 +163,78 @@ for pattern in valid_patterns:
         operational_patterns.append(pattern)
         retained_products.update(pattern_products)
 
-if len(operational_patterns) < 5:
+if len(operational_patterns) < 4:
     for pattern in valid_patterns:
         if pattern not in operational_patterns:
             operational_patterns.append(pattern)
-        if len(operational_patterns) >= 6:
+        if len(operational_patterns) >= 5:
             break
 
 num_pats = len(operational_patterns)
-target_vector = np.array([item_quantities[item] for item in selected_items])
 
-def get_yields_for_weights(w):
-    yields = np.zeros(len(selected_items))
-    for i, pattern in enumerate(operational_patterns):
+# Helper tool to evaluate item allocations given pattern tonnages
+def compute_yields(weights_list):
+    yields = {item: 0.0 for item in selected_items}
+    for idx, pattern in enumerate(operational_patterns):
+        w_pat = weights_list[idx]
         for width, prod in zip(pattern["widths"], pattern["products"]):
-            if prod in selected_items:
-                idx = selected_items.index(prod)
-                yields[idx] += w[i] * (width / pattern["deckle"])
+            if prod in yields:
+                yields[prod] += w_pat * (width / pattern["deckle"])
     return yields
 
-constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - total_material}]
-bounds = [(0.0, total_material) for _ in range(num_pats)]
-initial_guess = [total_material / num_pats] * num_pats
+# Grid Search Engine to fine-tune allocations natively
+best_weights = [total_material / num_pats] * num_pats
 
 if "Option 1" in strategy_option:
-    def objective_opt1(w):
-        return -1 * np.sum([w[i] * operational_patterns[i]["deckle"] for i in range(num_pats)])
+    # --- STRATEGY 1: MAXIMIZE DECKLES WHILE ENFORCING A STRICT 15% MASS BUFFER ---
+    best_score = float('-inf')
     
-    def quantity_lower_bound_constraint(w):
-        return get_yields_for_weights(w) - (0.85 * target_vector)
-    def quantity_upper_bound_constraint(w):
-        return (1.15 * target_vector) - get_yields_for_weights(w)
+    # Generate balanced grid check intervals summing to total target material mass
+    for steps in itertools.product(range(0, 101, 5), repeat=num_pats):
+        if sum(steps) == 0:
+            continue
+        scale = total_material / sum(steps)
+        test_w = [s * scale for s in steps]
         
-    constraints.append({'type': 'ineq', 'fun': quantity_lower_bound_constraint})
-    constraints.append({'type': 'ineq', 'fun': quantity_upper_bound_constraint})
-    
-    res = minimize(objective_opt1, initial_guess, bounds=bounds, constraints=constraints)
-    raw_weights = res.x if res.success else initial_guess
-else:
-    def objective_opt2(w):
-        calculated_yields = get_yields_for_weights(w)
-        return np.sum((calculated_yields - target_vector) ** 2)
+        sim_y = compute_yields(test_w)
         
-    res = minimize(objective_opt2, initial_guess, bounds=bounds, constraints=constraints)
-    raw_weights = res.x if res.success else initial_guess
+        # Guard check: Ensure deviations are strictly inside the 15% target thresholds
+        valid_allocation = True
+        for item in selected_items:
+            req = item_quantities[item]
+            if req > 0:
+                deviation = (sim_y[item] - req) / req
+                if abs(deviation) > 0.15:
+                    valid_allocation = False
+                    break
+        
+        if valid_allocation:
+            # Score calculated as the total weighted deckle length processed
+            score = sum(test_w[i] * operational_patterns[i]["deckle"] for i in range(num_pats))
+            if score > best_score:
+                best_score = score
+                best_weights = test_w
 
-pattern_weights = [max(0.0, round(float(wt), 2)) for wt in raw_weights]
+else:
+    # --- STRATEGY 2: BALANCED STRATEGY (MINIMIZE TARGET DIFFERENCES) ---
+    best_score = float('inf')
+    
+    for steps in itertools.product(range(0, 101, 5), repeat=num_pats):
+        if sum(steps) == 0:
+            continue
+        scale = total_material / sum(steps)
+        test_w = [s * scale for s in steps]
+        
+        sim_y = compute_yields(test_w)
+        
+        # Variance calculated as total squared discrepancy delta values
+        score = sum((sim_y[item] - item_quantities[item])**2 for item in selected_items)
+        if score < best_score:
+            best_score = score
+            best_weights = test_w
+
+# Post-process data filtering variables
+pattern_weights = [round(w, 2) for w in best_weights]
 
 filtered_patterns = []
 filtered_weights = []
@@ -228,20 +253,3 @@ else:
 simulated_yields = {item: 0.0 for item in selected_items}
 
 # =====================================================================
-# 5. BLUEPRINT WEB DASHBOARD DISPLAY & TEXT FORMATTING
-# =====================================================================
-st.header(f"📊 Production Blueprint Summary ({total_material:.2f} mt Total Run)")
-if "Option 1" in strategy_option:
-    st.info("🎯 Strategy: Option 1 Active. Maximizing deckle width while keeping item volumes within ±15% of targets.")
-else:
-    st.success("🎯 Strategy: Option 2 Active. Running custom weights per pattern to match your targets exactly.")
-
-cols = st.columns(len(operational_patterns))
-copyable_text_lines = []
-
-for i, (pattern, p_weight) in enumerate(zip(operational_patterns, pattern_weights)):
-    # FIX: Extract precise index values cleanly
-    w1 = pattern["widths"][0]
-    w2 = pattern["widths"][1]
-    w3 = pattern["widths"][2]
-    
