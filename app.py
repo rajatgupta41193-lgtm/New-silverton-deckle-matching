@@ -1,6 +1,8 @@
 import streamlit as st
 import itertools
 import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
 
 # Set page configurations
 st.set_page_config(page_title="Paper Mill Trim Optimizer", layout="wide", page_icon="🧻")
@@ -25,7 +27,6 @@ MAX_DECKLE = 2200
 # =====================================================================
 st.sidebar.header("📋 Production Parameters")
 
-# 1. Request Total Run Volume
 total_material = st.sidebar.number_input(
     "Enter TOTAL quantity required (Metric Tons / mt):", 
     min_value=0.1, 
@@ -34,14 +35,12 @@ total_material = st.sidebar.number_input(
     format="%.2f"
 )
 
-# 2. Render Active Inventory Checklist
 st.sidebar.subheader("Select Required Items for Current Run")
 selected_items = []
 for item in list(st.session_state.repository.keys()):
     if st.sidebar.checkbox(item, value=True, help=f"Current Widths: {st.session_state.repository[item]} mm"):
         selected_items.append(item)
 
-# 3. Collect Target Baseline Weights dynamically
 st.sidebar.subheader("Target Weights per Item (mt)")
 item_quantities = {}
 for item in selected_items:
@@ -59,11 +58,22 @@ if not selected_items:
     st.error("❌ Please select at least one item from the sidebar checklist to begin configuration.")
     st.stop()
 
+# Strategy Selector Switch
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎯 Optimization Plan Option")
+strategy_option = st.sidebar.radio(
+    "Choose your priority strategy:",
+    options=[
+        "Option 1: Maximize Deckle (Strict Max 15% Quantity Shift)", 
+        "Option 2: Balanced Strategy"
+    ]
+)
+
 # =====================================================================
 # 3. MAIN AREA: INVENTORY MANAGEMENT DASHBOARD
 # =====================================================================
 st.title("🧻 Paper Mill Production Deckle Optimization System")
-st.markdown("Calculate zero-waste (0 mm trim) 3-reel slitter configurations prioritizing maximum deckle sizes.")
+st.markdown("Calculate zero-waste (0 mm trim) 3-reel slitter configurations with intelligent quantity balancing.")
 
 with st.expander("🔧 MANAGE INVENTORY & CHANGE ITEM WIDTHS", expanded=False):
     st.subheader("Modify Widths of Existing Items or Create New Ones")
@@ -114,7 +124,7 @@ with st.expander("🔧 MANAGE INVENTORY & CHANGE ITEM WIDTHS", expanded=False):
                 st.rerun()
 
 # =====================================================================
-# 4. DECKLE SCHEDULING ENGINE
+# 4. DECKLE SCHEDULING & DYNAMIC OPTIMIZATION ENGINE
 # =====================================================================
 master_list = []
 for item in selected_items:
@@ -140,12 +150,11 @@ for combo in itertools.combinations_with_replacement(master_list, 3):
                 "products": products_sorted
             })
 
-valid_patterns.sort(key=lambda x: (-x["deckle"], x["widths"]))
-
 if not valid_patterns:
     st.error("❌ Mathematically impossible to find a zero-waste 3-reel pattern with the chosen sizes within 2160 mm - 2200 mm.")
     st.stop()
 
+valid_patterns.sort(key=lambda x: (-x["deckle"], x["widths"]))
 operational_patterns = []
 retained_products = set()
 
@@ -154,84 +163,85 @@ for pattern in valid_patterns:
     if not pattern_products.issubset(retained_products) or pattern["deckle"] == MAX_DECKLE:
         operational_patterns.append(pattern)
         retained_products.update(pattern_products)
-    if len(retained_products) == len(selected_items) and len(operational_patterns) >= 2:
-        break
 
-if not operational_patterns and valid_patterns:
-    operational_patterns = [valid_patterns[0]]
+if len(operational_patterns) < 5:
+    for pattern in valid_patterns:
+        if pattern not in operational_patterns:
+            operational_patterns.append(pattern)
+        if len(operational_patterns) >= 6:
+            break
 
-total_patterns = len(operational_patterns)
-tonnage_per_pattern = total_material / total_patterns
+num_pats = len(operational_patterns)
+target_vector = np.array([item_quantities[item] for item in selected_items])
 
-# Crucial initialization fix for weight calculation tracking
+def get_yields_for_weights(w):
+    yields = np.zeros(len(selected_items))
+    for i, pattern in enumerate(operational_patterns):
+        for width, prod in zip(pattern["widths"], pattern["products"]):
+            if prod in selected_items:
+                idx = selected_items.index(prod)
+                yields[idx] += w[i] * (width / pattern["deckle"])
+    return yields
+
+constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - total_material}]
+bounds = [(0.0, total_material) for _ in range(num_pats)]
+initial_guess = [total_material / num_pats] * num_pats
+
+if "Option 1" in strategy_option:
+    def objective_opt1(w):
+        return -1 * np.sum([w[i] * operational_patterns[i]["deckle"] for i in range(num_pats)])
+    
+    def quantity_lower_bound_constraint(w):
+        return get_yields_for_weights(w) - (0.85 * target_vector)
+    def quantity_upper_bound_constraint(w):
+        return (1.15 * target_vector) - get_yields_for_weights(w)
+        
+    constraints.append({'type': 'ineq', 'fun': quantity_lower_bound_constraint})
+    constraints.append({'type': 'ineq', 'fun': quantity_upper_bound_constraint})
+    
+    res = minimize(objective_opt1, initial_guess, bounds=bounds, constraints=constraints)
+    raw_weights = res.x if res.success else initial_guess
+else:
+    def objective_opt2(w):
+        calculated_yields = get_yields_for_weights(w)
+        return np.sum((calculated_yields - target_vector) ** 2)
+        
+    res = minimize(objective_opt2, initial_guess, bounds=bounds, constraints=constraints)
+    raw_weights = res.x if res.success else initial_guess
+
+pattern_weights = [max(0.0, round(float(wt), 2)) for wt in raw_weights]
+
+filtered_patterns = []
+filtered_weights = []
+for pat, wt in zip(operational_patterns, pattern_weights):
+    if wt > 0.05:
+        filtered_patterns.append(pat)
+        filtered_weights.append(wt)
+
+if filtered_patterns:
+    operational_patterns = filtered_patterns
+    pattern_weights = filtered_weights
+else:
+    operational_patterns = operational_patterns[:2]
+    pattern_weights = [total_material / 2] * 2
+
 simulated_yields = {item: 0.0 for item in selected_items}
 
 # =====================================================================
 # 5. BLUEPRINT WEB DASHBOARD DISPLAY & TEXT FORMATTING
 # =====================================================================
 st.header(f"📊 Production Blueprint Summary ({total_material:.2f} mt Total Run)")
-st.info("💡 The system has optimized configurations to favor the 2200 mm deckle and guarantee 0 mm waste.")
+if "Option 1" in strategy_option:
+    st.info("🎯 Strategy: Option 1 Active. Maximizing deckle width while keeping item volumes within ±15% of targets.")
+else:
+    st.success("🎯 Strategy: Option 2 Active. Running custom weights per pattern to match your targets exactly.")
 
-cols = st.columns(total_patterns)
+cols = st.columns(len(operational_patterns))
 copyable_text_lines = []
 
-for i, pattern in enumerate(operational_patterns):
+for i, (pattern, p_weight) in enumerate(zip(operational_patterns, pattern_weights)):
+    # FIX: Extract precise index values cleanly
     w1 = pattern["widths"][0]
     w2 = pattern["widths"][1]
     w3 = pattern["widths"][2]
     
-    # Format perfectly: 638+645+917=2200 4.29 mt
-    pattern_string = f"{w1}+{w2}+{w3}={pattern['deckle']} {tonnage_per_pattern:.2f} mt"
-    copyable_text_lines.append(pattern_string)
-    
-    with cols[i]:
-        st.subheader(f"✂️ Pattern {i+1}: Deckle {pattern['deckle']} mm")
-        st.metric(label="Target Batch Allocation", value=f"{tonnage_per_pattern:.2f} mt")
-        
-        knife_data = []
-        for j, (w, prod) in enumerate(zip(pattern["widths"], pattern["products"]), 1):
-            weight_fraction = w / pattern["deckle"]
-            calculated_mass = tonnage_per_pattern * weight_fraction
-            if prod in simulated_yields:
-                simulated_yields[prod] += calculated_mass
-                
-            knife_data.append({
-                "Knife Target": f"Position #{j}",
-                "Width (mm)": w,
-                "Product Allocation": prod,
-                "Yield Output (mt)": round(calculated_mass, 2)
-            })
-            
-        st.table(pd.DataFrame(knife_data))
-
-# =====================================================================
-# 6. UNIFIED COPYABLE TEXT SECTION
-# =====================================================================
-st.write("---")
-st.header("📋 Copyable Production Text")
-st.markdown("Tap the button inside the box below to instantly copy these settings:")
-
-final_copy_block = "\n".join(copyable_text_lines)
-st.code(final_copy_block, language="text")
-
-# =====================================================================
-# 7. QUANTITY ADVICE COMPARISON VIEW
-# =====================================================================
-st.write("---")
-st.header("⚖️ Quantity Advice Comparison (Target vs Optimized Output)")
-
-comparison_rows = []
-for prod in selected_items:
-    target = item_quantities.get(prod, 0.0)
-    actual = simulated_yields.get(prod, 0.0)
-    variance = actual - target
-    
-    comparison_rows.append({
-        "Product Name": prod,
-        "Requested (mt)": round(target, 2),
-        "Optimized Final Yield (mt)": round(actual, 2),
-        "Variance Delta (mt)": f"+{variance:.2f}" if variance >= 0 else f"{variance:.2f}"
-    })
-
-df_compare = pd.DataFrame(comparison_rows)
-st.dataframe(df_compare, use_container_width=True, hide_index=True)
