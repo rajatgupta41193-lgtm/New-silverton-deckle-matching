@@ -179,10 +179,10 @@ def compute_actuals(selected):
 # RMSE
 # =====================================================
 def rmse(actual, target):
+    # safe lookup: if actual missing, assume 0
     return float(np.sqrt(np.mean([
-        (actual[k] - target[k])**2 for k in target
+        (actual.get(k, 0.0) - target[k])**2 for k in target
     ])))
-
 # =====================================================
 # UI
 # =====================================================
