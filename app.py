@@ -8,9 +8,13 @@ import numpy as np
 MIN_DECKLE = 2160
 MAX_DECKLE = 2200
 
-TARGET_TOP_PATTERNS = 250  # INDUSTRIAL CONTROL
+MIN_PATTERN_MT = 1.5
+MIN_REEL_MT = 0.4
+MAX_REEL_MT = 0.6
 
-st.set_page_config(page_title="Industrial Deckle Optimizer", layout="wide")
+MAX_PATTERNS = 20
+
+st.set_page_config(page_title="Mill Scheduler Pro", layout="wide")
 
 # =====================================================
 # INVENTORY
@@ -35,7 +39,7 @@ if "repository" not in st.session_state:
     }
 
 # =====================================================
-# INDUSTRIAL PATTERN GENERATION (SMART PRUNING)
+# PATTERN GENERATION (INDUSTRIAL FILTERED)
 # =====================================================
 @st.cache_data(show_spinner=False)
 def generate_patterns(selected_items, repo):
@@ -58,7 +62,6 @@ def generate_patterns(selected_items, repo):
             w2, p2 = slots[j]
             partial = w1 + w2
 
-            # early reject (very important speed gain)
             if partial + w2 > MAX_DECKLE:
                 break
 
@@ -72,11 +75,10 @@ def generate_patterns(selected_items, repo):
                 if total < MIN_DECKLE:
                     continue
 
-                # INDUSTRIAL QUALITY FILTER
-                efficiency = total / MAX_DECKLE
-
-                # reject weak patterns (key improvement)
-                if efficiency < 0.98:
+                # =================================================
+                # HARD CONSTRAINT 1: minimum pattern size
+                # =================================================
+                if (total / MAX_DECKLE) < 0.85:
                     continue
 
                 key = tuple(sorted([(w1,p1),(w2,p2),(w3,p3)])) + (total,)
@@ -87,14 +89,12 @@ def generate_patterns(selected_items, repo):
                 patterns.append({
                     "deckle": total,
                     "widths": [w1, w2, w3],
-                    "products": [p1, p2, p3],
-                    "eff": efficiency
+                    "products": [p1, p2, p3]
                 })
 
-    # KEEP ONLY BEST PATTERNS (INDUSTRIAL FILTER)
-    patterns.sort(key=lambda x: (x["eff"], x["deckle"]), reverse=True)
+    patterns.sort(key=lambda x: x["deckle"], reverse=True)
 
-    return patterns[:TARGET_TOP_PATTERNS]
+    return patterns[:200]   # pre-limit before optimization
 
 # =====================================================
 # MATRIX
@@ -115,48 +115,64 @@ def build_matrix(patterns, targets):
     return A, b, products
 
 # =====================================================
-# INDUSTRIAL OPTIMIZER (STABLE PROJECTION)
+# INDUSTRIAL OPTIMIZER
 # =====================================================
-def optimize(A, b, total_mt, max_iter=900):
+def optimize(A, b, total_mt):
     m, n = A.shape
 
-    # smart initialization (important improvement)
     x = np.ones(n) * (total_mt / n)
-
     lr = 0.04
 
-    for _ in range(max_iter):
+    for _ in range(800):
         Ax = A @ x
-
-        # weighted error (industrial stability improvement)
-        err = Ax - b
-        grad = 2 * (A.T @ err)
+        grad = 2 * (A.T @ (Ax - b))
 
         x = x - lr * grad
-
-        # projection (simplex)
         x = np.maximum(x, 0)
 
         s = x.sum()
-        if s == 0:
-            x[:] = total_mt / n
-        else:
-            x = x * (total_mt / s)
+        x = x * (total_mt / s if s > 0 else 1)
 
     return x
 
 # =====================================================
-# ACTUALS
+# POST PROCESSING (HARD BUSINESS RULES)
 # =====================================================
-def compute_actuals(patterns, x, products):
-    out = {p: 0.0 for p in products}
+def enforce_constraints(patterns, x):
+    result = []
 
     for pat, ton in zip(patterns, x):
+        if ton < MIN_PATTERN_MT:
+            continue
+
+        # enforce reel constraint 0.4–0.6 MT per width contribution
+        reel_ok = True
+
+        per_reel = []
+        for w in pat["widths"]:
+            share = ton * (w / pat["deckle"])
+            per_reel.append(share)
+
+        if any(s < MIN_REEL_MT or s > MAX_REEL_MT for s in per_reel):
+            reel_ok = False
+
+        if reel_ok:
+            result.append((pat, ton))
+
+    # limit to top 20 patterns
+    result = sorted(result, key=lambda x: x[1], reverse=True)[:MAX_PATTERNS]
+
+    return result
+
+# =====================================================
+# ACTUALS
+# =====================================================
+def compute_actuals(selected):
+    out = {}
+    for pat, ton in selected:
         d = pat["deckle"]
         for w, p in zip(pat["widths"], pat["products"]):
-            if p in out:
-                out[p] += ton * (w / d)
-
+            out[p] = out.get(p, 0) + ton * (w / d)
     return out
 
 # =====================================================
@@ -164,13 +180,13 @@ def compute_actuals(patterns, x, products):
 # =====================================================
 def rmse(actual, target):
     return float(np.sqrt(np.mean([
-        (actual[k] - target[k]) ** 2 for k in target
+        (actual[k] - target[k])**2 for k in target
     ])))
 
 # =====================================================
 # UI
 # =====================================================
-st.title("🏭 Industrial Deckle Optimizer (Production Grade)")
+st.title("🏭 Industrial Mill Scheduler (Constraint Engine)")
 
 total_mt = st.sidebar.number_input("Total MT", 1.0, 500.0, 30.0)
 
@@ -193,13 +209,13 @@ for item in selected:
 # =====================================================
 patterns = generate_patterns(tuple(selected), st.session_state.repository)
 
-st.write("Industrial patterns:", len(patterns))
-
 A, b, products = build_matrix(patterns, targets)
 
 x = optimize(A, b, total_mt)
 
-actual = compute_actuals(patterns, x, products)
+final_selected = enforce_constraints(patterns, x)
+
+actual = compute_actuals(final_selected)
 
 error = rmse(actual, targets)
 
@@ -207,13 +223,13 @@ error = rmse(actual, targets)
 # OUTPUT
 # =====================================================
 st.subheader(f"RMSE: {error:.3f}")
+st.write(f"Final patterns used: {len(final_selected)} (max {MAX_PATTERNS})")
 
-for pat, ton in zip(patterns, x):
-    if ton > 0.01:
-        st.write(
-            f"{pat['widths']} → {pat['deckle']} mm | "
-            f"{ton:.2f} MT | eff={pat['eff']:.3f}"
-        )
+for pat, ton in final_selected:
+    st.write(
+        f"{pat['widths']} → {pat['deckle']} mm | "
+        f"{ton:.2f} MT"
+    )
 
 # =====================================================
 # TABLE
