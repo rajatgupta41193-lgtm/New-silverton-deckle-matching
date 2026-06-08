@@ -6,8 +6,8 @@ import numpy as np
 # =====================================================================
 # CONSTANTS
 # =====================================================================
-MIN_DECKLE     = 2160
-MAX_DECKLE     = 2200
+MIN_DECKLE = 2160
+MAX_DECKLE = 2200
 
 st.set_page_config(
     page_title="Paper Mill Deckle Optimizer",
@@ -28,14 +28,44 @@ if "repository" not in st.session_state:
     }
 
 # =====================================================================
+# ROUNDING UTILITY — snap to nearest 0.5 mt, sum preserved
+# =====================================================================
+
+def round_to_500kg(tonnages, total_mt, min_pattern_mt):
+    """
+    Round each tonnage to the nearest 0.5 mt denomination (500 kg steps).
+    Valid values: 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, ...
+    After rounding, the largest pattern absorbs any residual so the
+    grand total stays exactly equal to total_mt.
+    Also ensures no pattern falls below min_pattern_mt after rounding.
+    """
+    if not tonnages:
+        return tonnages
+
+    # Snap each value to nearest 0.5
+    rounded = [round(t * 2) / 2 for t in tonnages]
+
+    # Clamp each to at least min_pattern_mt (also snapped to 0.5)
+    floor = round(min_pattern_mt * 2) / 2
+    rounded = [max(r, floor) for r in rounded]
+
+    # Fix total: adjust the largest pattern to compensate rounding drift
+    diff = round(total_mt - sum(rounded), 10)   # floating-point safe
+    if abs(diff) > 1e-9:
+        max_idx = rounded.index(max(rounded))
+        rounded[max_idx] = round((rounded[max_idx] + diff) * 2) / 2
+
+    return rounded
+
+
+# =====================================================================
 # CORE ENGINES
 # =====================================================================
 
 def find_valid_patterns(selected_items, repository):
     """
     Enumerate ALL valid 3-reel zero-waste patterns within deckle range.
-    Returns list of dicts: {deckle, widths:[w0,w1,w2], products:[p0,p1,p2]}
-    sorted highest deckle first.
+    Returns list of dicts sorted highest deckle first.
     """
     slots = []
     for item in selected_items:
@@ -74,8 +104,8 @@ def find_valid_patterns(selected_items, repository):
 
 def proportional_tons(patterns, target_weights, total_mt):
     """
-    Assign tonnage proportional to the sum of target weights each pattern covers.
-    Ensures Strategy 1 distributes tonnage by demand, not equal split.
+    Assign raw (unrounded) tonnage proportional to the sum of target
+    weights each pattern covers.
     """
     scores = []
     for pat in patterns:
@@ -91,8 +121,7 @@ def select_max_deckle_patterns(valid_patterns, selected_items, total_mt,
                                 target_weights, min_pattern_mt):
     """
     Strategy 1: greedy highest-deckle selection covering all products.
-    Enforces min_pattern_mt — uses proportional tonnage distribution.
-    Drops lowest-priority patterns if their proportional share < min_pattern_mt.
+    Uses proportional tonnage; drops patterns whose share < min_pattern_mt.
     """
     operational = []
     covered = set()
@@ -106,11 +135,10 @@ def select_max_deckle_patterns(valid_patterns, selected_items, total_mt,
 
     result = operational if operational else (valid_patterns[:1] if valid_patterns else [])
 
-    # Drop tail patterns that would fall below min_pattern_mt on proportional split
+    # Drop patterns whose proportional share would fall below min_pattern_mt
     while len(result) > 1:
         tons = proportional_tons(result, target_weights, total_mt)
         if min(tons) < min_pattern_mt:
-            # Remove the pattern with the smallest proportional share
             min_idx = tons.index(min(tons))
             result = [p for i, p in enumerate(result) if i != min_idx]
         else:
@@ -138,8 +166,7 @@ def solve_balanced_lp(all_patterns, target_weights, total_mt,
     Strategy 2: Adam gradient descent on all valid patterns.
     Minimises Σ_prod (actual_yield - target)²
     Subject to: x_i >= 0, Σ x_i = total_mt, each used pattern >= min_pattern_mt.
-
-    Returns (tonnages, used_patterns).
+    Returns (raw_tonnages, used_patterns) — rounding applied later.
     """
     n = len(all_patterns)
     if n == 0:
@@ -147,7 +174,6 @@ def solve_balanced_lp(all_patterns, target_weights, total_mt,
 
     prod_list = list(target_weights.keys())
 
-    # Precompute fraction matrix: frac[i][p] = width / deckle for slot p in pattern i
     frac = []
     for pat in all_patterns:
         d = {}
@@ -163,7 +189,6 @@ def solve_balanced_lp(all_patterns, target_weights, total_mt,
                     a[p] += x[i] * f
         return a
 
-    # Initialise
     x = [total_mt / n] * n
     m = [0.0] * n
     v = [0.0] * n
@@ -193,7 +218,7 @@ def solve_balanced_lp(all_patterns, target_weights, total_mt,
     # Phase 2: enforce min_pattern_mt iteratively
     tons = [x[i] for i in active_idx]
     s = sum(tons)
-    tons = [t * total_mt / s for t in tons]   # rescale to total_mt
+    tons = [t * total_mt / s for t in tons]
 
     changed = True
     while changed and len(active_idx) > 1:
@@ -211,7 +236,6 @@ def solve_balanced_lp(all_patterns, target_weights, total_mt,
             active_idx = [idx for j, idx in enumerate(active_idx) if j != min_pos]
             changed = True
 
-    # Final rescale
     final_sum = sum(tons)
     tonnages      = [t * total_mt / final_sum for t in tons]
     used_patterns = [all_patterns[i] for i in active_idx]
@@ -245,7 +269,6 @@ total_mt = st.sidebar.number_input(
     min_value=0.1, value=12.0, step=0.5, format="%.2f"
 )
 
-# --- Min pattern tonnage selector (0.5 mt steps: 1.5 → 2.0 → 2.5 → 3.0) ---
 MIN_PATTERN_MT = st.sidebar.select_slider(
     "Minimum tonnage per pattern (mt):",
     options=[1.5, 2.0, 2.5, 3.0],
@@ -253,7 +276,9 @@ MIN_PATTERN_MT = st.sidebar.select_slider(
 )
 st.sidebar.caption(
     f"⚠️ Every active pattern must carry **≥ {MIN_PATTERN_MT} mt**. "
-    f"Patterns below this floor are dropped and tonnage redistributed."
+    f"Patterns below this floor are dropped and tonnage redistributed. "
+    f"All final pattern quantities are rounded to **500 kg steps** "
+    f"(e.g. 2.0, 2.5, 3.0 mt)."
 )
 
 st.sidebar.subheader("Select Items for This Run")
@@ -281,8 +306,8 @@ if not selected_items:
 # =====================================================================
 st.title("🧻 Paper Mill Deckle Optimization System")
 st.markdown(
-    f"**0 mm trim · 3-reel slitter · LP Engine v2.2 · Adam Optimiser · "
-    f"≥ {MIN_PATTERN_MT} mt per pattern · Proportional tonnage in Strategy ①**"
+    f"**0 mm trim · 3-reel slitter · LP Engine v2.3 · Adam Optimiser · "
+    f"≥ {MIN_PATTERN_MT} mt per pattern · Quantities in 500 kg steps**"
 )
 
 # =====================================================================
@@ -347,19 +372,21 @@ if not all_patterns:
     )
     st.stop()
 
-# Strategy 1 — Max Deckle (proportional tonnage)
-max_patterns = select_max_deckle_patterns(
+# ── Strategy 1 — Max Deckle (proportional → rounded to 500 kg) ──────
+max_patterns   = select_max_deckle_patterns(
     all_patterns, selected_items, total_mt, item_quantities, MIN_PATTERN_MT
 )
-max_tons    = proportional_tons(max_patterns, item_quantities, total_mt)
-max_actuals = compute_actuals(max_patterns, max_tons)
-max_rmse    = rmse(max_actuals, item_quantities)
+max_tons_raw   = proportional_tons(max_patterns, item_quantities, total_mt)
+max_tons       = round_to_500kg(max_tons_raw, total_mt, MIN_PATTERN_MT)
+max_actuals    = compute_actuals(max_patterns, max_tons)
+max_rmse       = rmse(max_actuals, item_quantities)
 
-# Strategy 2 — Balanced LP
+# ── Strategy 2 — Balanced LP (Adam → rounded to 500 kg) ─────────────
 with st.spinner("⚙️ Running LP optimiser…"):
-    bal_tons, bal_patterns = solve_balanced_lp(
+    bal_tons_raw, bal_patterns = solve_balanced_lp(
         all_patterns, item_quantities, total_mt, MIN_PATTERN_MT
     )
+bal_tons    = round_to_500kg(bal_tons_raw, total_mt, MIN_PATTERN_MT)
 bal_actuals = compute_actuals(bal_patterns, bal_tons)
 bal_rmse    = rmse(bal_actuals, item_quantities)
 
@@ -377,27 +404,26 @@ show_max = mode in ["① Maximize Deckle", "Compare Both"]
 show_bal = mode in ["② Balanced LP", "Compare Both"]
 
 # =====================================================================
-# LP INFO STRIP
+# INFO STRIPS
 # =====================================================================
 if show_bal:
     st.info(
         f"**② Balanced LP:** Evaluates all **{len(all_patterns)}** valid zero-waste patterns "
-        f"simultaneously using Adam gradient descent (8,000 iterations). Tonnage is distributed "
-        f"to minimise Σ(actual − target)² per product. "
-        f"**Constraint: every active pattern must carry ≥ {MIN_PATTERN_MT} mt** — patterns below "
-        f"this floor are dropped and tonnage redistributed proportionally. "
-        f"RMSE = root mean square error; lower = closer to your targets."
+        f"simultaneously using Adam gradient descent (8,000 iterations). Tonnage minimises "
+        f"Σ(actual − target)² per product, then is **snapped to the nearest 500 kg step**. "
+        f"Every active pattern carries ≥ {MIN_PATTERN_MT} mt. "
+        f"RMSE = root mean square error after rounding; lower = closer to targets."
     )
 
 if show_max:
     st.info(
         f"**① Maximize Deckle:** Selects highest-deckle patterns covering all products. "
-        f"Tonnage is distributed **proportionally** based on each pattern's share of target demand "
-        f"(not equal split). Every pattern carries ≥ {MIN_PATTERN_MT} mt."
+        f"Tonnage distributed **proportionally** by target demand, then **rounded to nearest "
+        f"500 kg step**. Every pattern carries ≥ {MIN_PATTERN_MT} mt."
     )
 
 # =====================================================================
-# HELPER: render one strategy's patterns
+# HELPER: render one strategy
 # =====================================================================
 def render_strategy(patterns, tonnages, strategy_label, rmse_val):
     rmse_color = "🟢" if rmse_val < 0.3 else ("🟡" if rmse_val < 1.0 else "🔴")
@@ -412,9 +438,12 @@ def render_strategy(patterns, tonnages, strategy_label, rmse_val):
         deckle     = pat["deckle"]
         tag        = "🔴 MAX" if deckle == MAX_DECKLE else "🔵 OK"
 
+        # Display ton in clean format: show as integer if whole number
+        ton_display = f"{int(ton * 1000)} kg  ({ton:.1f} mt)"
+
         st.markdown(
             f"**Pattern {i+1}:** `{w0}+{w1}+{w2}={deckle} mm` {tag} — "
-            f"`{ton:.3f} mt`"
+            f"**`{ton_display}`**"
         )
 
         rows = []
@@ -427,7 +456,7 @@ def render_strategy(patterns, tonnages, strategy_label, rmse_val):
                 "Yield (mt)":     round(yield_mt, 3),
             })
         st.table(pd.DataFrame(rows))
-        copy_lines.append(f"{w0}+{w1}+{w2}={deckle}  {ton:.2f} mt")
+        copy_lines.append(f"{w0}+{w1}+{w2}={deckle}  {ton:.1f} mt  ({int(ton*1000)} kg)")
 
     return "\n".join(copy_lines)
 
@@ -517,7 +546,7 @@ st.write("---")
 st.caption(
     f"Deckle range: {MIN_DECKLE}–{MAX_DECKLE} mm · "
     f"Min pattern tonnage: {MIN_PATTERN_MT} mt · "
+    f"Quantity denomination: 500 kg steps · "
     f"Total valid patterns found: {len(all_patterns)} · "
     f"LP patterns evaluated: {len(all_patterns)}"
 )
-
