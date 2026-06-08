@@ -1,242 +1,162 @@
 import streamlit as st
-import pandas as pd
+import itertools
 import numpy as np
+import pandas as pd
 
-# =====================================================
+# =========================
 # CONFIG
-# =====================================================
+# =========================
 MIN_DECKLE = 2160
 MAX_DECKLE = 2200
-
-MIN_PATTERN_MT = 1.5
 MAX_PATTERNS = 20
+MIN_PATTERN_MT = 1.5
 
-st.set_page_config(page_title="Mill Deckle Planner", layout="wide")
+st.set_page_config(page_title="Mill Pattern Planner", layout="wide")
 
-# =====================================================
+# =========================
 # INVENTORY
-# =====================================================
-if "repository" not in st.session_state:
-    st.session_state.repository = {
-        "50 ri": [652, 778, 904],
-        "50/46 old": [645, 770, 895],
-        "*60/35 uncle": [655, 782, 905],
-        "65 ri": [550, 675, 805],
-        "65 gi": [550, 680, 810],
-        "*80/48": [675, 805, 935],
-        "80/49": [700, 835],
-        "80/50": [718, 860],
+# =========================
+if "repo" not in st.session_state:
+    st.session_state.repo = {
+        "50/46 new": [638, 764, 890],
         "80/46": [660, 790, 915],
         "60/46": [660, 790, 917],
-        "50/46 new": [638, 764, 890],
-        "100/50": [595, 735, 880],
-        "60/43": [630, 750, 875],
-        "50/43": [614, 735, 855],
-        "200/55": [705, 875],
+        "50/46 old": [645, 770, 895],
+        "65 ri": [550, 675, 805],
     }
 
-# =====================================================
-# INPUT: DEMAND (REAL PRODUCTION STYLE)
-# =====================================================
-st.title("🏭 Industrial Mill Planner (Demand Driven)")
+# =========================
+# INPUTS
+# =========================
+st.title("🏭 Paper Mill 3-Reel Pattern Planner")
 
-st.subheader("📦 Enter Demand (MT per product)")
+TOTAL_MT = st.sidebar.number_input("Total MT required", 1.0, 500.0, 30.0)
+
+st.sidebar.subheader("Demand per item")
 
 demand = {}
-
-for item in st.session_state.repository:
-    qty = st.number_input(
-        f"{item} (MT)",
-        min_value=0.0,
-        value=0.0,
-        step=0.5
-    )
+for item in st.session_state.repo:
+    qty = st.sidebar.number_input(item, 0.0, 100.0, 0.0, step=0.5)
     if qty > 0:
         demand[item] = qty
 
 if not demand:
-    st.warning("Enter at least one product demand")
     st.stop()
 
-TOTAL_MT = sum(demand.values())
-
-st.info(f"Total required production = {TOTAL_MT:.2f} MT")
-
-selected_items = list(demand.keys())
-
-# =====================================================
-# PATTERN GENERATION (PRUNED)
-# =====================================================
-@st.cache_data(show_spinner=False)
-def generate_patterns(selected_items, repo):
+# =========================
+# STEP 1: GENERATE VALID PATTERNS
+# =========================
+def generate_patterns(demand, repo):
     slots = []
-    for item in selected_items:
-        for w in repo[item]:
-            slots.append((w, item))
-
-    slots.sort()
+    for p in demand:
+        for w in repo[p]:
+            slots.append((w, p))
 
     patterns = []
     seen = set()
 
-    n = len(slots)
-
-    for i in range(n):
+    for i, j, k in itertools.combinations_with_replacement(range(len(slots)), 3):
         w1, p1 = slots[i]
+        w2, p2 = slots[j]
+        w3, p3 = slots[k]
 
-        for j in range(i, n):
-            w2, p2 = slots[j]
-            partial = w1 + w2
+        total = w1 + w2 + w3
 
-            if partial + w2 > MAX_DECKLE:
-                break
+        if total < MIN_DECKLE or total > MAX_DECKLE:
+            continue
 
-            for k in range(j, n):
-                w3, p3 = slots[k]
-                total = partial + w3
+        key = tuple(sorted([w1, w2, w3]))
+        if key in seen:
+            continue
+        seen.add(key)
 
-                if total > MAX_DECKLE:
-                    break
+        patterns.append({
+            "widths": [w1, w2, w3],
+            "products": [p1, p2, p3],
+            "deckle": total
+        })
 
-                if total < MIN_DECKLE:
-                    continue
+    return patterns
 
-                key = tuple(sorted([(w1,p1),(w2,p2),(w3,p3)])) + (total,)
-                if key in seen:
-                    continue
-                seen.add(key)
+patterns = generate_patterns(demand, st.session_state.repo)
 
-                patterns.append({
-                    "deckle": total,
-                    "widths": [w1, w2, w3],
-                    "products": [p1, p2, p3]
-                })
+if not patterns:
+    st.error("No valid patterns found")
+    st.stop()
 
-    patterns.sort(key=lambda x: x["deckle"], reverse=True)
-    return patterns[:300]
+# =========================
+# STEP 2: SCORE PATTERNS
+# =========================
+def score_pattern(pat):
+    return sum(demand.get(p, 0) for p in pat["products"])
 
-# =====================================================
-# MATRIX
-# =====================================================
-def build_matrix(patterns, demand):
-    products = list(demand.keys())
-    idx = {p:i for i,p in enumerate(products)}
+patterns.sort(key=score_pattern, reverse=True)
+patterns = patterns[:200]
 
-    A = np.zeros((len(products), len(patterns)))
+# =========================
+# STEP 3: SELECT TOP PATTERNS (MAX 20)
+# =========================
+patterns = patterns[:MAX_PATTERNS]
 
-    for j, pat in enumerate(patterns):
-        d = pat["deckle"]
-        for w, p in zip(pat["widths"], pat["products"]):
-            if p in idx:
-                A[idx[p], j] += w / d
+# =========================
+# STEP 4: ALLOCATE TONNAGE
+# =========================
+scores = np.array([score_pattern(p) for p in patterns], dtype=float)
 
-    b = np.array([demand[p] for p in products], dtype=float)
-    return A, b, products
+if scores.sum() == 0:
+    tons = np.ones(len(patterns)) * (TOTAL_MT / len(patterns))
+else:
+    tons = TOTAL_MT * scores / scores.sum()
 
-# =====================================================
-# OPTIMIZER (MULTI-PATTERN BALANCED SOLUTION)
-# =====================================================
-def optimize(A, b, total_mt, max_iter=1200):
-
-    n = A.shape[1]
-
-    x = np.ones(n) * (total_mt / n)
-    lr = 0.04
-
-    for _ in range(max_iter):
-        Ax = A @ x
-        grad = 2 * (A.T @ (Ax - b))
-
-        x = x - lr * grad
-        x = np.maximum(x, 0)
-
-        s = x.sum()
-        if s == 0:
-            x[:] = total_mt / n
-        else:
-            x = x * (total_mt / s)
-
-    return x
-
-# =====================================================
-# ACTUALS
-# =====================================================
-def compute_actuals(patterns, x, products):
-    out = {p: 0.0 for p in products}
-
-    for pat, ton in zip(patterns, x):
-        d = pat["deckle"]
-        for w, p in zip(pat["widths"], pat["products"]):
-            if p in out:
-                out[p] += ton * (w / d)
-
-    return out
-
-# =====================================================
-# RMSE
-# =====================================================
-def rmse(actual, target):
-    return float(np.sqrt(np.mean([
-        (actual[k] - target[k]) ** 2 for k in target
-    ])))
-
-# =====================================================
-# RUN
-# =====================================================
-patterns = generate_patterns(tuple(selected_items), st.session_state.repository)
-
-A, b, products = build_matrix(patterns, demand)
-
-x = optimize(A, b, TOTAL_MT)
-
-actual = compute_actuals(patterns, x, products)
-
-error = rmse(actual, demand)
-
-# =====================================================
-# FILTER OUTPUT (INDUSTRIAL RULES)
-# =====================================================
-st.subheader(f"RMSE: {error:.3f}")
-
-final_patterns = []
-final_tons = []
-
-for pat, ton in zip(patterns, x):
-    if ton >= MIN_PATTERN_MT:
-        final_patterns.append(pat)
-        final_tons.append(ton)
-
-# enforce max 20 patterns
-if len(final_patterns) > MAX_PATTERNS:
-    idx = np.argsort(-np.array(final_tons))[:MAX_PATTERNS]
-    final_patterns = [final_patterns[i] for i in idx]
-    final_tons = [final_tons[i] for i in idx]
+# enforce minimum MT
+for i in range(len(tons)):
+    if tons[i] < MIN_PATTERN_MT:
+        diff = MIN_PATTERN_MT - tons[i]
+        tons[i] = MIN_PATTERN_MT
+        for j in range(len(tons)):
+            if j != i:
+                tons[j] -= diff / (len(tons)-1)
 
 # renormalize
-if sum(final_tons) > 0:
-    final_tons = np.array(final_tons)
-    final_tons = final_tons * (TOTAL_MT / final_tons.sum())
+tons = np.maximum(tons, 0)
+tons = TOTAL_MT * tons / tons.sum()
 
-# =====================================================
+# =========================
+# STEP 5: ACTUAL OUTPUT
+# =========================
+def compute_actuals(patterns, tons):
+    out = {}
+    for pat, t in zip(patterns, tons):
+        for w, p in zip(pat["widths"], pat["products"]):
+            out[p] = out.get(p, 0) + t * (w / pat["deckle"])
+    return out
+
+actuals = compute_actuals(patterns, tons)
+
+# =========================
 # OUTPUT
-# =====================================================
-for pat, ton in zip(final_patterns, final_tons):
-    st.write(
-        f"{pat['widths']} → {pat['deckle']} mm | "
-        f"{ton:.2f} MT"
-    )
+# =========================
+st.header("📊 Pattern Plan")
 
-# =====================================================
-# TABLE
-# =====================================================
+for i, (pat, t) in enumerate(zip(patterns, tons), 1):
+    st.write(f"""
+**Pattern {i}:**
+{pat['widths']} → {pat['deckle']} mm  
+➡ {t:.2f} MT
+""")
+
+st.header("📦 Summary")
+
 df = pd.DataFrame([
     {
         "Product": k,
         "Demand": v,
-        "Actual": actual.get(k, 0),
-        "Diff": actual.get(k, 0) - v
+        "Actual": actuals.get(k, 0),
+        "Deviation": actuals.get(k, 0) - v
     }
     for k, v in demand.items()
 ])
+
+df.loc[len(df)] = ["TOTAL", TOTAL_MT, sum(actuals.values()), sum(actuals.values()) - TOTAL_MT]
 
 st.dataframe(df, use_container_width=True)
