@@ -9,12 +9,9 @@ MIN_DECKLE = 2160
 MAX_DECKLE = 2200
 
 MIN_PATTERN_MT = 1.5
-MIN_REEL_MT = 0.4
-MAX_REEL_MT = 0.6
-
 MAX_PATTERNS = 20
 
-st.set_page_config(page_title="Mill Scheduler Pro", layout="wide")
+st.set_page_config(page_title="Industrial Deckle Optimizer", layout="wide")
 
 # =====================================================
 # INVENTORY
@@ -39,7 +36,7 @@ if "repository" not in st.session_state:
     }
 
 # =====================================================
-# PATTERN GENERATION (INDUSTRIAL FILTERED)
+# PATTERN GENERATION (FAST + PRUNED)
 # =====================================================
 @st.cache_data(show_spinner=False)
 def generate_patterns(selected_items, repo):
@@ -75,13 +72,7 @@ def generate_patterns(selected_items, repo):
                 if total < MIN_DECKLE:
                     continue
 
-                # =================================================
-                # HARD CONSTRAINT 1: minimum pattern size
-                # =================================================
-                if (total / MAX_DECKLE) < 0.85:
-                    continue
-
-                key = tuple(sorted([(w1,p1),(w2,p2),(w3,p3)])) + (total,)
+                key = tuple(sorted([(w1, p1), (w2, p2), (w3, p3)])) + (total,)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -89,19 +80,19 @@ def generate_patterns(selected_items, repo):
                 patterns.append({
                     "deckle": total,
                     "widths": [w1, w2, w3],
-                    "products": [p1, p2, p3]
+                    "products": [p1, p2, p3],
                 })
 
+    # Keep only top patterns (speed control)
     patterns.sort(key=lambda x: x["deckle"], reverse=True)
-
-    return patterns[:200]   # pre-limit before optimization
+    return patterns[:300]
 
 # =====================================================
-# MATRIX
+# MATRIX BUILD
 # =====================================================
 def build_matrix(patterns, targets):
     products = list(targets.keys())
-    idx = {p:i for i,p in enumerate(products)}
+    idx = {p: i for i, p in enumerate(products)}
 
     A = np.zeros((len(products), len(patterns)))
 
@@ -115,15 +106,17 @@ def build_matrix(patterns, targets):
     return A, b, products
 
 # =====================================================
-# INDUSTRIAL OPTIMIZER
+# INDUSTRIAL OPTIMIZER (NO SCIPY)
 # =====================================================
-def optimize(A, b, total_mt):
-    m, n = A.shape
+def optimize(A, b, total_mt, min_mt=1.5, max_patterns=20, max_iter=1000):
+
+    n = A.shape[1]
 
     x = np.ones(n) * (total_mt / n)
     lr = 0.04
 
-    for _ in range(800):
+    # Gradient descent (convex relaxation)
+    for _ in range(max_iter):
         Ax = A @ x
         grad = 2 * (A.T @ (Ax - b))
 
@@ -131,62 +124,63 @@ def optimize(A, b, total_mt):
         x = np.maximum(x, 0)
 
         s = x.sum()
-        x = x * (total_mt / s if s > 0 else 1)
+        if s == 0:
+            x[:] = total_mt / n
+        else:
+            x = x * (total_mt / s)
 
-    return x
+    # =================================================
+    # ENFORCE MIN PATTERN LOAD
+    # =================================================
+    active = np.where(x >= min_mt)[0]
 
-# =====================================================
-# POST PROCESSING (HARD BUSINESS RULES)
-# =====================================================
-def enforce_constraints(patterns, x):
-    result = []
+    if len(active) == 0:
+        active = np.array([np.argmax(x)])
 
-    for pat, ton in zip(patterns, x):
-        if ton < MIN_PATTERN_MT:
-            continue
+    x_active = x[active]
 
-        # enforce reel constraint 0.4–0.6 MT per width contribution
-        reel_ok = True
+    # =================================================
+    # LIMIT MAX PATTERNS (TOP 20 ONLY)
+    # =================================================
+    if len(x_active) > max_patterns:
+        top_idx = np.argsort(-x_active)[:max_patterns]
+        active = active[top_idx]
+        x_active = x[active]
 
-        per_reel = []
-        for w in pat["widths"]:
-            share = ton * (w / pat["deckle"])
-            per_reel.append(share)
+    # =================================================
+    # RENORMALIZE TO TOTAL MT
+    # =================================================
+    if x_active.sum() > 0:
+        x_active = x_active * (total_mt / x_active.sum())
 
-        if any(s < MIN_REEL_MT or s > MAX_REEL_MT for s in per_reel):
-            reel_ok = False
-
-        if reel_ok:
-            result.append((pat, ton))
-
-    # limit to top 20 patterns
-    result = sorted(result, key=lambda x: x[1], reverse=True)[:MAX_PATTERNS]
-
-    return result
+    return x_active, active
 
 # =====================================================
 # ACTUALS
 # =====================================================
-def compute_actuals(selected):
-    out = {}
-    for pat, ton in selected:
+def compute_actuals(patterns, x, products):
+    out = {p: 0.0 for p in products}
+
+    for pat, ton in zip(patterns, x):
         d = pat["deckle"]
         for w, p in zip(pat["widths"], pat["products"]):
-            out[p] = out.get(p, 0) + ton * (w / d)
+            if p in out:
+                out[p] += ton * (w / d)
+
     return out
 
 # =====================================================
-# RMSE
+# ERROR
 # =====================================================
 def rmse(actual, target):
-    # safe lookup: if actual missing, assume 0
     return float(np.sqrt(np.mean([
-        (actual.get(k, 0.0) - target[k])**2 for k in target
+        (actual[k] - target[k]) ** 2 for k in target
     ])))
+
 # =====================================================
 # UI
 # =====================================================
-st.title("🏭 Industrial Mill Scheduler (Constraint Engine)")
+st.title("🏭 Industrial Deckle Optimizer (Final Version)")
 
 total_mt = st.sidebar.number_input("Total MT", 1.0, 500.0, 30.0)
 
@@ -205,17 +199,19 @@ for item in selected:
     )
 
 # =====================================================
-# RUN
+# RUN ENGINE
 # =====================================================
 patterns = generate_patterns(tuple(selected), st.session_state.repository)
 
+st.write("Patterns generated:", len(patterns))
+
 A, b, products = build_matrix(patterns, targets)
 
-x = optimize(A, b, total_mt)
+x, active_idx = optimize(A, b, total_mt)
 
-final_selected = enforce_constraints(patterns, x)
+active_patterns = [patterns[i] for i in active_idx]
 
-actual = compute_actuals(final_selected)
+actual = compute_actuals(active_patterns, x, products)
 
 error = rmse(actual, targets)
 
@@ -223,13 +219,13 @@ error = rmse(actual, targets)
 # OUTPUT
 # =====================================================
 st.subheader(f"RMSE: {error:.3f}")
-st.write(f"Final patterns used: {len(final_selected)} (max {MAX_PATTERNS})")
 
-for pat, ton in final_selected:
-    st.write(
-        f"{pat['widths']} → {pat['deckle']} mm | "
-        f"{ton:.2f} MT"
-    )
+for pat, ton in zip(active_patterns, x):
+    if ton > 0.01:
+        st.write(
+            f"{pat['widths']} → {pat['deckle']} mm | "
+            f"{ton:.2f} MT"
+        )
 
 # =====================================================
 # TABLE
